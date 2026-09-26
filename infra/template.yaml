@@ -1,0 +1,203 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Evidence Ledger - Serverless backend for multimodal evidence compilation
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - prod
+    Description: Deployment environment name
+
+  AllowedOrigins:
+    Type: String
+    Default: 'http://localhost:5173,https://*.vercel.app'
+    Description: Comma-separated list of allowed CORS origins
+
+  BedrockNovaLiteModelId:
+    Type: String
+    Default: 'amazon.nova-lite-v1:0'
+    Description: Model ID for Bedrock Nova Lite (visual document/image extraction)
+
+  BedrockNovaMicroModelId:
+    Type: String
+    Default: 'amazon.nova-micro-v1:0'
+    Description: Model ID for Bedrock Nova Micro (text and transcript extraction)
+
+  SarvamApiKey:
+    Type: String
+    NoEcho: true
+    Default: ''
+    Description: API subscription key for Sarvam Speech-to-Text
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Timeout: 30
+    MemorySize: 512
+    Environment:
+      Variables:
+        DYNAMODB_TABLE_NAME: !Ref EvidenceTable
+        S3_BUCKET_NAME: !Ref EvidenceBucket
+        ALLOWED_ORIGINS: !Ref AllowedOrigins
+        BEDROCK_NOVA_LITE_MODEL_ID: !Ref BedrockNovaLiteModelId
+        BEDROCK_NOVA_MICRO_MODEL_ID: !Ref BedrockNovaMicroModelId
+        SARVAM_API_KEY: !Ref SarvamApiKey
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # API GATEWAY (HTTP API)
+  # ---------------------------------------------------------------------------
+  EvidenceApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: '$default'
+      CorsConfiguration:
+        AllowMethods:
+          - GET
+          - POST
+          - PATCH
+          - PUT
+          - DELETE
+          - OPTIONS
+          - HEAD
+        AllowHeaders:
+          - '*'
+        AllowOrigins:
+          - '*'
+        MaxAge: 86400
+
+
+  # ---------------------------------------------------------------------------
+  # DYNAMODB TABLE (SINGLE TABLE DESIGN)
+  # ---------------------------------------------------------------------------
+  EvidenceTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'evidence-ledger-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  # ---------------------------------------------------------------------------
+  # S3 EVIDENCE BUCKET (PRIVATE, ENCRYPTED, LIFECYCLE)
+  # ---------------------------------------------------------------------------
+  EvidenceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'evidence-ledger-storage-${AWS::AccountId}-${Environment}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - '*'
+            AllowedMethods:
+              - GET
+              - PUT
+              - HEAD
+            AllowedOrigins:
+              - '*'
+            MaxAge: 3600
+      LifecycleConfiguration:
+        Rules:
+          - Id: EvidenceRetention
+            Status: Enabled
+            ExpirationInDays: 30
+
+  # ---------------------------------------------------------------------------
+  # LAMBDA FUNCTIONS
+  # ---------------------------------------------------------------------------
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/
+      Handler: evidence_ledger.handlers.api.lambda_handler
+      Description: REST API router for Evidence Ledger
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EvidenceTable
+        - S3CrudPolicy:
+            BucketName: !Sub 'evidence-ledger-storage-${AWS::AccountId}-${Environment}'
+      Events:
+        ApiCatchAll:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref EvidenceApi
+            Path: /{proxy+}
+            Method: ANY
+        ApiRoot:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref EvidenceApi
+            Path: /
+            Method: ANY
+
+  ProcessingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/
+      Handler: evidence_ledger.handlers.processing.lambda_handler
+      Description: S3 ObjectCreated multimodal processing worker
+      Timeout: 120
+      MemorySize: 1024
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EvidenceTable
+        - S3CrudPolicy:
+            BucketName: !Sub 'evidence-ledger-storage-${AWS::AccountId}-${Environment}'
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:Converse
+              Resource: '*'
+
+  ExportFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/
+      Handler: evidence_ledger.handlers.export.lambda_handler
+      Description: Export generation worker for CSV and PDF packets
+      Timeout: 60
+      MemorySize: 512
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EvidenceTable
+        - S3CrudPolicy:
+            BucketName: !Sub 'evidence-ledger-storage-${AWS::AccountId}-${Environment}'
+
+Outputs:
+  HttpApiUrl:
+    Description: Base URL for HTTP API v1
+    Value: !Sub 'https://${EvidenceApi}.execute-api.${AWS::Region}.amazonaws.com/v1'
+
+  DynamoTableName:
+    Description: DynamoDB Table Name
+    Value: !Ref EvidenceTable
+
+  EvidenceBucketName:
+    Description: S3 Evidence Storage Bucket
+    Value: !Ref EvidenceBucket

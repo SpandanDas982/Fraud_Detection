@@ -1,0 +1,216 @@
+name: CI/CD Pipeline (Unified Deploy)
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Component to deploy'
+        required: true
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - backend
+          - frontend
+          - both
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'prod'
+        type: choice
+        options:
+          - prod
+          - dev
+
+jobs:
+  detect-changes:
+    name: Detect Changed Directories
+    runs-on: ubuntu-latest
+    outputs:
+      run_backend: ${{ steps.decide.outputs.run_backend }}
+      run_frontend: ${{ steps.decide.outputs.run_frontend }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Check directory path changes
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            backend:
+              - 'backend/**'
+              - 'infra/**'
+            frontend:
+              - 'frontend/**'
+
+      - name: Decide components to run
+        id: decide
+        run: |
+          TARGET="${{ github.event.inputs.target || 'auto' }}"
+          BACKEND_CHANGED="${{ steps.filter.outputs.backend }}"
+          FRONTEND_CHANGED="${{ steps.filter.outputs.frontend }}"
+
+          RUN_BACKEND="false"
+          RUN_FRONTEND="false"
+
+          if [ "$TARGET" = "both" ]; then
+            RUN_BACKEND="true"
+            RUN_FRONTEND="true"
+          elif [ "$TARGET" = "backend" ]; then
+            RUN_BACKEND="true"
+          elif [ "$TARGET" = "frontend" ]; then
+            RUN_FRONTEND="true"
+          else
+            # auto mode: check directory changes or default to both
+            if [ "$BACKEND_CHANGED" = "true" ]; then
+              RUN_BACKEND="true"
+            fi
+            if [ "$FRONTEND_CHANGED" = "true" ]; then
+              RUN_FRONTEND="true"
+            fi
+            if [ "$BACKEND_CHANGED" = "false" ] && [ "$FRONTEND_CHANGED" = "false" ]; then
+              RUN_BACKEND="true"
+              RUN_FRONTEND="true"
+            fi
+          fi
+
+
+          echo "Selected target: $TARGET"
+          echo "Run Backend: $RUN_BACKEND"
+          echo "Run Frontend: $RUN_FRONTEND"
+          echo "run_backend=$RUN_BACKEND" >> $GITHUB_OUTPUT
+          echo "run_frontend=$RUN_FRONTEND" >> $GITHUB_OUTPUT
+
+  deploy-backend:
+    name: Test & Deploy Backend (AWS SAM)
+    needs: detect-changes
+    if: needs.detect-changes.outputs.run_backend == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      api_url: ${{ steps.sam-deploy.outputs.api_url }}
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v2
+        with:
+          version: 'latest'
+
+      - name: Sync dependencies
+        run: uv sync --extra dev
+
+      - name: Run Ruff Linter
+        run: uv run ruff check src/ tests/
+
+      - name: Run Pytest Suite
+        run: uv run pytest --maxfail=1 --disable-warnings
+
+      - name: Set up AWS SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
+
+      - name: SAM Build
+        run: sam build --template-file ../infra/template.yaml
+
+      - name: SAM Deploy
+        id: sam-deploy
+        run: |
+          ENV_NAME="${{ github.event.inputs.environment || 'prod' }}"
+          STACK_NAME="evidence-ledger-backend-${ENV_NAME}"
+
+          sam deploy \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --stack-name "$STACK_NAME" \
+            --resolve-s3 \
+            --capabilities CAPABILITY_IAM \
+            --parameter-overrides \
+                Environment="$ENV_NAME" \
+                AllowedOrigins="http://localhost:5173,https://*.vercel.app,${{ secrets.FRONTEND_URL || '*' }}" \
+                SarvamApiKey="${{ secrets.SARVAM_API_KEY || secrets.SARVAM_AI_KEY }}"
+
+          API_URL=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='HttpApiUrl'].OutputValue" \
+            --output text || echo "")
+
+          echo "Deployed API URL: $API_URL"
+          echo "api_url=$API_URL" >> $GITHUB_OUTPUT
+
+  deploy-frontend:
+    name: Test & Deploy Frontend (Vercel)
+    needs: [detect-changes, deploy-backend]
+    if: always() && needs.detect-changes.outputs.run_frontend == 'true' && (needs.deploy-backend.result == 'success' || needs.deploy-backend.result == 'skipped')
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        run: npm run lint
+
+      - name: Configure Backend API URL
+        run: |
+          API_URL="${{ needs.deploy-backend.outputs.api_url }}"
+          if [ -z "$API_URL" ]; then
+            API_URL="${{ secrets.VITE_API_BASE_URL }}"
+          fi
+          if [ -n "$API_URL" ]; then
+            echo "VITE_API_BASE_URL=$API_URL" >> .env.production
+            echo "Configured VITE_API_BASE_URL: $API_URL"
+          fi
+
+      - name: Build Vite application
+        run: npm run build
+
+      - name: Deploy to Vercel
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          ENV_TYPE: ${{ github.event.inputs.environment || 'prod' }}
+        run: |
+          if [ "$ENV_TYPE" = "prod" ]; then
+            npx vercel pull --yes --environment=production --token=$VERCEL_TOKEN
+            npx vercel build --prod --token=$VERCEL_TOKEN
+            npx vercel deploy --prebuilt --prod --token=$VERCEL_TOKEN
+          else
+            npx vercel pull --yes --environment=preview --token=$VERCEL_TOKEN
+            npx vercel build --token=$VERCEL_TOKEN
+            npx vercel deploy --prebuilt --token=$VERCEL_TOKEN
+          fi

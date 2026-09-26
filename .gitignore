@@ -1,0 +1,5 @@
+.agents
+.playwright-mcp/
+*.png
+.env
+.env.*
